@@ -156,8 +156,20 @@ def fetch_underlying(app_id: str, access_token: str, mcode: str,
 
 def build_legs(underlying: pd.DataFrame, mcode: str, option_types: list[str],
                window_hours: int, strike_step: int = STRIKE_STEP) -> list[dict]:
-    """One leg per (window, option_type), strike picked from the underlying's
-    most recent close at or before that window's start."""
+    """One leg per (option_type, run of consecutive windows that all land on
+    the SAME ATM strike), strike picked from the underlying's most recent
+    close at or before each window's start.
+
+    Windows are still checked every `window_hours` to see whether the ATM
+    strike should roll, but consecutive windows that come out to the same
+    strike are merged into a single leg spanning all of them (window_end
+    pushed out to the last one) instead of being run as separate,
+    independently-truncated legs -- a leg only ends where the strike
+    actually changes (or the data does). Each leg also carries
+    "fetch_until": the overall end of the available underlying data, so the
+    caller can fetch this leg's symbol beyond its own window_end and let an
+    already-open trade run to its natural exit instead of being cut off at
+    the window boundary (see run_legs_candle_breakout's entry_cutoff use)."""
     if underlying.empty:
         return []
 
@@ -172,39 +184,62 @@ def build_legs(underlying: pd.DataFrame, mcode: str, option_types: list[str],
     ]
 
     legs = []
-    for w_start, w_end in windows:
-        ref_rows = underlying[underlying["datetime"] <= w_start]
-        if ref_rows.empty:
-            continue
-        ref_price = float(ref_rows.iloc[-1]["close"])
-        strike = nearest_strike(ref_price, strike_step)
-
-        for opt in option_types:
+    for opt in option_types:
+        current = None
+        for w_start, w_end in windows:
+            ref_rows = underlying[underlying["datetime"] <= w_start]
+            if ref_rows.empty:
+                continue
+            ref_price = float(ref_rows.iloc[-1]["close"])
+            strike = nearest_strike(ref_price, strike_step)
             symbol = f"MCX:{SYMBOL_PREFIX}{mcode}{strike}{opt}"
-            legs.append({
+
+            if current is not None and current["symbol"] == symbol:
+                # Same strike still ATM -- extend the running leg instead of
+                # closing it out and opening an identical new one.
+                current["window_end"] = w_end
+                continue
+
+            if current is not None:
+                legs.append(current)
+            current = {
                 "window_start": w_start,
                 "window_end": w_end,
                 "option_type": opt,
                 "underlying_ref_price": ref_price,
                 "strike": strike,
                 "symbol": symbol,
-            })
+                "fetch_until": data_end_dt,
+            }
+        if current is not None:
+            legs.append(current)
+
+    legs.sort(key=lambda leg: (leg["window_start"], leg["option_type"]))
     return legs
 
 
 def _fetch_leg_df(leg: dict, app_id: str, access_token: str, resolution: str,
-                   fetch_cache: dict) -> pd.DataFrame | None:
+                   fetch_cache: dict, fetch_end: dt.datetime | None = None) -> pd.DataFrame | None:
     """Shared per-leg fetch used by every strategy runner below: pulls (and
-    caches, per symbol+day, so a strike carried across consecutive same-day
+    caches, per symbol+day-range, so a strike carried across consecutive
     windows isn't re-fetched) the option's candles, timezone-normalizes them,
-    and clips to this leg's own window. Returns None if nothing usable came
-    back (caller decides how to record that)."""
-    key = (leg["symbol"], leg["window_start"].date(), leg["window_end"].date())
+    and clips to this leg's window. Returns None if nothing usable came back
+    (caller decides how to record that).
+
+    fetch_end, if given, extends the fetch (and the clip's upper bound)
+    past leg["window_end"] up to fetch_end instead of stopping at the
+    window -- used by run_legs_candle_breakout so a trade still open when
+    the window ends can keep being tracked, on this same symbol's data,
+    all the way to its own natural exit (see candle_breakout's
+    entry_cutoff). Without it (the default), behavior is unchanged: clipped
+    to the leg's own window."""
+    clip_end = max(leg["window_end"], fetch_end) if fetch_end is not None else leg["window_end"]
+    key = (leg["symbol"], leg["window_start"].date(), clip_end.date())
     if key not in fetch_cache:
         fetch_cache[key] = fetch_history(
             symbol=leg["symbol"], resolution=resolution,
             start_date=leg["window_start"].date().isoformat(),
-            end_date=leg["window_end"].date().isoformat(),
+            end_date=clip_end.date().isoformat(),
             access_token=access_token, app_id=app_id,
         )
     day_df = fetch_cache[key]
@@ -215,7 +250,7 @@ def _fetch_leg_df(leg: dict, app_id: str, access_token: str, resolution: str,
         day_df = day_df.copy()
         day_df["datetime"] = day_df["datetime"].dt.tz_localize(None)
     return day_df[(day_df["datetime"] >= leg["window_start"].replace(tzinfo=None))
-                  & (day_df["datetime"] <= leg["window_end"].replace(tzinfo=None))].reset_index(drop=True)
+                  & (day_df["datetime"] <= clip_end.replace(tzinfo=None))].reset_index(drop=True)
 
 
 def run_legs(legs: list[dict], app_id: str, access_token: str, resolution: str,
@@ -278,15 +313,24 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
     candle breakout-and-retest-fill strategy (core/candle_breakout.py)
     instead of the consolidation-box order block. Each leg (one CE window,
     one PE window) is its own independent run, so a CE trade and a PE trade
-    can be open at the same time, but neither strategy call carries a
-    position across into the next leg."""
+    can be open at the same time -- but a leg's OWN window no longer forces
+    its trade closed: this fetches the leg's symbol data through
+    leg["fetch_until"] (the overall backtest end, not just window_end) and
+    passes entry_cutoff=window_end so no NEW position opens on this symbol
+    once its window has passed, while a trade already open (or pending)
+    keeps being tracked on this same leg's data all the way to its own
+    natural exit -- SL, target/trailing stop, the max-hold cutoff, or truly
+    running out of data. build_legs() already merges consecutive
+    same-strike windows into one leg, so this only ever creates a genuine
+    cutoff at an actual strike roll."""
     fetch_cache: dict = {}
     all_trades = []
     window_results = []
 
     for n, leg in enumerate(legs, start=1):
         try:
-            df = _fetch_leg_df(leg, app_id, access_token, resolution, fetch_cache)
+            df = _fetch_leg_df(leg, app_id, access_token, resolution, fetch_cache,
+                                fetch_end=leg.get("fetch_until"))
         except Exception as e:
             window_results.append({**leg, "status": "no_data", "error": str(e), "rows": 0,
                                     "trades": 0, "pnl_points": None, "win_rate_pct": None})
@@ -302,7 +346,8 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
             continue
 
         trades = run_candle_breakout_backtest(
-            df, time_start=time_start, time_end=time_end, **breakout_kwargs,
+            df, time_start=time_start, time_end=time_end,
+            entry_cutoff=leg["window_end"].replace(tzinfo=None), **breakout_kwargs,
         )
 
         if not trades.empty:

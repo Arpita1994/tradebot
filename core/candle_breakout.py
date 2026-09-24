@@ -130,14 +130,21 @@ def _entry_candle_sl(bar: pd.Series, sl_buffer_pct: float, max_loss_points: floa
     return raw_sl
 
 
-def _trail_sl(open_trade: dict, bar: pd.Series, sl_buffer_pct: float) -> None:
-    """If `bar` is green, recompute a candidate stop loss (this candle's low
-    - sl_buffer_pct of its own body -- no max_loss_points cap; see
-    _entry_candle_sl's docstring for why), and raise the trade's stop to it
-    if -- and only if -- that's actually higher than the current stop. The
-    stop never moves down, so a pullback candle can't drag it back toward
-    the entry."""
+def _trail_sl(open_trade: dict, bar: pd.Series, sl_buffer_pct: float, trail_min_body_points: float) -> None:
+    """If `bar` is green AND its body is at least trail_min_body_points (a
+    minimum size in price points -- trail_min_body_points <= 0 disables this
+    check, so every green candle qualifies, same as before), recompute a
+    candidate stop loss (this candle's low - sl_buffer_pct of its own body --
+    no max_loss_points cap; see _entry_candle_sl's docstring for why), and
+    raise the trade's stop to it if -- and only if -- that's actually higher
+    than the current stop. The stop never moves down, so a pullback candle
+    can't drag it back toward the entry. This only looks at the single
+    candle that just closed -- there is no multi-candle lookback here, by
+    design: the trailing stop always follows just the previous candle."""
     if bar["close"] <= bar["open"]:
+        return
+    body = bar["close"] - bar["open"]
+    if trail_min_body_points and trail_min_body_points > 0 and body < trail_min_body_points:
         return
     candidate_sl = _raw_candle_sl(bar, sl_buffer_pct)
     if candidate_sl > open_trade["sl_price"]:
@@ -158,6 +165,8 @@ def run_candle_breakout_backtest(
     body_filter_mode: str = "and",
     exit_mode: str = "target",
     max_loss_points: float = 0.0,
+    trail_min_body_points: float = 0.0,
+    entry_cutoff=None,
 ) -> pd.DataFrame:
     """
     body_filter_mode controls how the two decisive-body checks (relative %
@@ -173,6 +182,42 @@ def run_candle_breakout_backtest(
       "trailing" -- no target. The SL ratchets up off every subsequent green
                     candle while the trade is open (see _trail_sl above).
                     reward_risk is ignored in this mode.
+
+    trail_min_body_points (trailing mode only) -- a green candle only moves
+    the trailing stop if its OWN body is at least this many price points.
+    0 (default) means every green candle qualifies, same as before this was
+    added. This looks at just the single candle that just closed each time
+    -- no averaging or multi-candle lookback -- it's simply a minimum size
+    filter so a tiny, insignificant green candle can't become the new trail
+    anchor. (Separate from body_lookback_candles/body_pct_of_avg/
+    min_body_points/body_filter_mode above, which only gate NEW entries.)
+
+    DAY SQUARE-OFF: when time_end is given, any trade still open the moment
+    a candle's time reaches time_end is force-closed right there at that
+    candle's close, tagged "day_square_off" -- it never carries into the
+    next day's candles. An unfilled pending order at that point is dropped
+    the same way rather than left to fill tomorrow. This applies on EVERY
+    day time_end is crossed, however many days of data `df` spans (the
+    ATM-options caller may now hand this function several days of the same
+    contract's candles at once -- see entry_cutoff below); each day gets
+    its own fresh square-off, and a new signal can only start a new
+    position the following day once in_session is true again. Without
+    time_end (or with only time_start set), no square-off happens and a
+    trade can run for as long as max_hold_bars / the data allows, same as
+    before this was added.
+
+    entry_cutoff -- if given (a pandas-comparable timestamp), no NEW signal
+    is generated and no NEW pending order is created for a candle whose
+    datetime is >= entry_cutoff. This is for the ATM-options caller: once a
+    leg's own window has ended (its strike is no longer the freshly-picked
+    ATM strike), it shouldn't open fresh positions on that now-stale
+    contract. It does NOT affect a trade that's already open (or already
+    pending) at that point -- that trade keeps being managed (SL/target/
+    trailing-stop checks) using whatever bars of `df` extend past the
+    cutoff, all the way to its own natural exit, exactly as if there were
+    no cutoff at all. The cutoff stops the strategy from looking for a NEW
+    position on a symbol once its window has passed -- it never forces an
+    existing position closed just because the window ended.
     """
     if body_filter_mode not in ("relative", "absolute", "and", "or"):
         raise ValueError(f"body_filter_mode must be one of 'relative', 'absolute', "
@@ -207,6 +252,7 @@ def run_candle_breakout_backtest(
 
     for i in range(n):
         bar = df.iloc[i]
+        day_cutoff_hit = time_end is not None and bar["datetime"].time() >= time_end
 
         # 1) manage an already-open trade first (entered on an earlier bar)
         if open_trade is not None:
@@ -215,7 +261,7 @@ def run_candle_breakout_backtest(
                 _record_exit(exit_price, exit_reason, bar)
                 open_trade = None
             elif exit_mode == "trailing":
-                _trail_sl(open_trade, bar, sl_buffer_pct)
+                _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points)
 
         # 2) check whether a pending order fills on THIS bar -- it is only
         #    ever checked once, on the single bar right after the green
@@ -240,19 +286,31 @@ def run_candle_breakout_backtest(
                         _record_exit(exit_price, exit_reason, bar)
                         open_trade = None
                     elif exit_mode == "trailing":
-                        _trail_sl(open_trade, bar, sl_buffer_pct)
+                        _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points)
                 pending = None  # filled or expired -- gone either way, never carries forward
             elif i > pending["valid_bar"]:
                 pending = None
+
+        # 2.5) day square-off: force-close any trade still open once this
+        # candle reaches the day's defined time_end, instead of letting it
+        # carry into the next day's candles -- a fresh, unfilled pending
+        # order is also dropped here rather than left to fill tomorrow.
+        if day_cutoff_hit:
+            if open_trade is not None:
+                _record_exit(bar["close"], "day_square_off", bar)
+                open_trade = None
+            pending = None
 
         # 3) at the close of this candle, look for a fresh green-candle setup
         in_session = True
         if time_start is not None and time_end is not None:
             t = bar["datetime"].time()
             in_session = time_start <= t <= time_end
+        before_cutoff = entry_cutoff is None or bar["datetime"] < entry_cutoff
         is_green = bar["close"] > bar["open"]
 
-        if is_green and in_session and open_trade is None and pending is None and i + 1 < n:
+        if (is_green and in_session and before_cutoff and not day_cutoff_hit
+                and open_trade is None and pending is None and i + 1 < n):
             body = bar["close"] - bar["open"]
             bar_avg_body = avg_body.iloc[i]
             passes_relative = pd.isna(bar_avg_body) or body >= (body_pct_of_avg / 100.0) * bar_avg_body

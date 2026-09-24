@@ -41,7 +41,9 @@ except Exception:
 
 from core.strategy import StrategyParams, generate_signals
 from core.backtest import run_backtest
-from core.metrics import summarize, equity_curve, format_minutes, add_net_pnl, daily_summary
+from core.metrics import (
+    summarize, equity_curve, format_minutes, add_net_pnl, daily_summary, exit_reason_breakdown,
+)
 from core.atm_options import (
     compute_current_option_month, month_code, fetch_underlying, build_legs,
     run_legs, run_legs_candle_breakout,
@@ -213,8 +215,18 @@ if source == "ATM Options (current month, live)":
 
         if atm_exit_mode == "target":
             atm_rr = st.sidebar.slider("Reward:Risk multiple", 0.5, 5.0, 2.0, 0.5, key="atm_rr_bo")
+            atm_trail_min_body = 0.0  # unused in target mode (no trailing at all)
         else:
             atm_rr = 2.0  # unused in trailing mode
+            atm_trail_min_body = st.sidebar.number_input(
+                "Trailing update: minimum body (points, 0 = any green candle)",
+                0.0, 1000.0, 0.0, 1.0, key="atm_trail_min_body",
+                help="The trailing stop only follows the single PREVIOUS candle -- no "
+                     "averaging or lookback. This sets a minimum size (in price points) "
+                     "that candle's own body must have before it's allowed to move the "
+                     "stop, so a tiny/insignificant green candle can't become the new "
+                     "trail anchor. 0 = every green candle qualifies (default)."
+            )
 
         st.sidebar.header("4. Decisive candle body")
         atm_body_mode_label = st.sidebar.selectbox(
@@ -321,6 +333,7 @@ if source == "ATM Options (current month, live)":
                 body_filter_mode=atm_body_mode,
                 exit_mode=atm_exit_mode,
                 max_loss_points=float(atm_max_loss_points),
+                trail_min_body_points=float(atm_trail_min_body),
             )
             with st.spinner("Running per-window backtests..."):
                 window_df, combined = run_legs_candle_breakout(
@@ -380,6 +393,17 @@ if source == "ATM Options (current month, live)":
             cols2[3].metric("Longs / Shorts", f"{overall.get('longs', 0)} / {overall.get('shorts', 0)}")
 
             combined_net = add_net_pnl(combined, cost_points_per_trade)
+
+            st.subheader("Exit reasons")
+            st.caption(
+                "'eod_no_exit' trades never hit their SL or target (or the max-hold cutoff) -- "
+                "they were force-closed because the data ran out before the trade could resolve. "
+                "Their P&L is somewhat arbitrary; treat them with a bit of skepticism, especially if "
+                "they're a large share. 'day_square_off' trades hit the day's defined time_end while "
+                "still open -- that's a deliberate flat-by-end-of-day rule, not a backtest artifact, "
+                "so its P&L is real (just cut short of wherever the trade might have gone overnight)."
+            )
+            st.dataframe(exit_reason_breakdown(combined), use_container_width=True)
 
             st.subheader("Trade log")
             st.dataframe(combined_net, use_container_width=True)
@@ -513,6 +537,14 @@ if st.sidebar.button("Run backtest", type="primary"):
         st.bar_chart(duration_minutes.value_counts(bins=15).sort_index())
 
         trades_net = add_net_pnl(trades, cost_points_per_trade)
+
+        st.subheader("Exit reasons")
+        st.caption(
+            "'eod_no_exit' trades never hit their SL or target (or the max-hold cutoff) -- "
+            "they were force-closed because the data ran out. Their P&L is somewhat arbitrary; "
+            "treat them with a bit of skepticism, especially if they're a large share."
+        )
+        st.dataframe(exit_reason_breakdown(trades), use_container_width=True)
 
         st.subheader("Trade log")
         st.dataframe(trades_net, use_container_width=True)

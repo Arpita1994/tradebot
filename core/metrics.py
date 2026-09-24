@@ -54,6 +54,35 @@ def format_minutes(minutes: float) -> str:
     return f"{hours}h {mins}m"
 
 
+def exit_reason_breakdown(trades: pd.DataFrame) -> pd.DataFrame:
+    """Counts trades by exit_reason (sl / target / eod_no_exit /
+    day_square_off / ...), with each reason's share of total trades and its
+    own win rate. Useful for spotting how many trades were forced closed
+    rather than hitting a real SL or target:
+      "eod_no_exit"    -- the max-hold cutoff, or the data simply running
+                          out, before SL/target was ever reached. Somewhat
+                          arbitrary and worth treating with a bit of
+                          skepticism.
+      "day_square_off" -- the day's defined trading time range (time_end)
+                          was reached with the trade still open. This is a
+                          deliberate strategy rule (flat by end of day), not
+                          a backtest artifact -- its P&L is real, just cut
+                          short of wherever the trade might have gone had
+                          it been allowed to run into the next day."""
+    cols = ["exit_reason", "count", "pct_of_trades", "win_rate_pct", "total_pnl_points"]
+    if trades.empty:
+        return pd.DataFrame(columns=cols)
+
+    total = len(trades)
+    grouped = trades.groupby("exit_reason").agg(
+        count=("pnl_points", "count"),
+        win_rate_pct=("pnl_points", lambda s: round(100 * (s > 0).sum() / len(s), 2)),
+        total_pnl_points=("pnl_points", lambda s: round(s.sum(), 2)),
+    ).reset_index()
+    grouped["pct_of_trades"] = round(100 * grouped["count"] / total, 2)
+    return grouped[cols].sort_values("count", ascending=False).reset_index(drop=True)
+
+
 def equity_curve(trades: pd.DataFrame) -> pd.DataFrame:
     if trades.empty:
         return pd.DataFrame(columns=["exit_datetime", "cum_pnl_points"])
