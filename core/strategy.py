@@ -2,8 +2,9 @@
 Combines all the requested inputs into entry signals:
   - time of day window
   - volume going up
-  - order block (mitigation of a fresh order block)
-  - lookback time (used for volume avg + order block detection window)
+  - order block = a consolidation box (>= min_candles tight candles), broken
+    out of, then bought/sold on the retest
+  - lookback time (used for volume avg + the box's tightness baseline)
   - trend analysis with N lookback candles (trade only with the trend)
   - % of order block used as stop loss
 
@@ -18,24 +19,26 @@ from datetime import time as dtime
 import pandas as pd
 
 from core.indicators import volume_going_up, trend_direction
-from core.order_block import detect_order_blocks, mark_mitigations
+from core.order_block import detect_consolidation_boxes, mark_mitigations
 
 
 @dataclass
 class StrategyParams:
     start_time: dtime
     end_time: dtime
-    lookback_time: int              # bars used for volume-avg & OB detection window
+    lookback_time: int              # bars used for volume avg & the box's tightness baseline
     volume_spike_multiplier: float  # how far above average volume counts as "going up"
-    ob_spike_multiplier: float      # volume spike multiplier required to qualify as an order block
-    displacement_window: int        # bars allowed for the impulsive move confirming an OB
-    sl_pct_of_ob: float              # % of order block range added beyond the OB as stop loss
+    consolidation_candles: int      # minimum consecutive candles required to count as a
+                                      # consolidation box (your "at least 5-10 candles" input)
+    consolidation_tightness: float  # box's total height must stay within this many times the
+                                      # average single-candle range to still count as "tight"
+    sl_pct_of_ob: float              # % of box range added beyond the box as stop loss
     trend_lookback_candles: int      # N candles for trend analysis
     reward_risk: float = 2.0         # target = risk * this multiple (not one of the named
                                       # inputs, but needed to define an exit -- defaults to 2:1)
     require_trend_alignment: bool = True
-    min_touches: int = 1             # 1 = enter on first touch (original behavior);
-                                      # >1 = require the zone to hold N touches first
+    min_touches: int = 1             # 1 = enter on first retest of the broken box edge;
+                                      # >1 = require the retest to hold N times first
 
 
 def generate_signals(df: pd.DataFrame, params: StrategyParams):
@@ -46,11 +49,11 @@ def generate_signals(df: pd.DataFrame, params: StrategyParams):
     time_mask = (df["datetime"].dt.time >= params.start_time) & \
                 (df["datetime"].dt.time <= params.end_time)
 
-    blocks = detect_order_blocks(
+    blocks = detect_consolidation_boxes(
         df,
-        lookback=params.lookback_time,
-        spike_multiplier=params.ob_spike_multiplier,
-        displacement_window=params.displacement_window,
+        min_candles=params.consolidation_candles,
+        tightness_multiplier=params.consolidation_tightness,
+        baseline_lookback=params.lookback_time,
     )
     mark_mitigations(df, blocks, min_touches=params.min_touches)
 

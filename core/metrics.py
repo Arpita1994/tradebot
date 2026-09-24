@@ -60,3 +60,49 @@ def equity_curve(trades: pd.DataFrame) -> pd.DataFrame:
     t = trades.sort_values("exit_datetime").copy()
     t["cum_pnl_points"] = t["pnl_points"].cumsum()
     return t[["exit_datetime", "cum_pnl_points"]]
+
+
+def add_net_pnl(trades: pd.DataFrame, cost_points: float = 4.0) -> pd.DataFrame:
+    """Adds a 'net_pnl_points' column: pnl_points minus a flat per-trade cost
+    (brokerage/taxes, in points), so the trade log shows both the raw price
+    move (pnl_points) and what actually lands in the account (net_pnl_points).
+    Returns a new DataFrame; does not mutate the input."""
+    out = trades.copy()
+    if out.empty:
+        out["net_pnl_points"] = pd.Series(dtype=float)
+    else:
+        out["net_pnl_points"] = out["pnl_points"] - cost_points
+    return out
+
+
+def daily_summary(trades: pd.DataFrame, cost_points: float = 4.0) -> pd.DataFrame:
+    """One row per calendar day (grouped by exit date, since that's when a
+    trade's P&L is actually realized): trade count, win/loss count (by the
+    raw price move -- pnl_points > 0 counts as a win, independent of costs),
+    that day's win rate, that day's GROSS P&L (before costs), that day's NET
+    P&L (after cost_points per trade), and the running cumulative NET P&L
+    across days up to and including that day -- i.e. the "net realised P&L"
+    equity curve, in points."""
+    cols = ["date", "trades", "wins", "losses", "win_rate_pct",
+            "gross_pnl_points", "net_pnl_points", "net_realised_pnl_points"]
+    if trades.empty:
+        return pd.DataFrame(columns=cols)
+
+    t = trades.copy()
+    t["net_pnl_points"] = t["pnl_points"] - cost_points
+    t["date"] = pd.to_datetime(t["exit_datetime"]).dt.date
+
+    grouped = t.groupby("date").agg(
+        trades=("pnl_points", "count"),
+        wins=("pnl_points", lambda s: int((s > 0).sum())),
+        losses=("pnl_points", lambda s: int((s <= 0).sum())),
+        gross_pnl_points=("pnl_points", "sum"),
+        net_pnl_points=("net_pnl_points", "sum"),
+    ).reset_index().sort_values("date")
+
+    grouped["win_rate_pct"] = round(100 * grouped["wins"] / grouped["trades"], 2)
+    grouped["gross_pnl_points"] = grouped["gross_pnl_points"].round(2)
+    grouped["net_pnl_points"] = grouped["net_pnl_points"].round(2)
+    grouped["net_realised_pnl_points"] = grouped["net_pnl_points"].cumsum().round(2)
+
+    return grouped[cols]
