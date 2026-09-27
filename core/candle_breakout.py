@@ -106,15 +106,29 @@ def _check_exit(open_trade: dict, bar: pd.Series, bar_index: int, max_hold_bars:
     return None, None
 
 
-def _raw_candle_sl(bar: pd.Series, sl_buffer_pct: float) -> float:
-    """The plain stop loss a given green candle implies: low - sl_buffer_pct
-    of its own body. No max_loss_points cap -- see _entry_candle_sl for the
-    capped version, used only at entry."""
+def _sl_anchor(bar: pd.Series, sl_basis: str) -> float:
+    """The price the sl_buffer_pct offset is measured down FROM.
+      "wick_low" (default, original behavior) -- the candle's actual low,
+                 wick included.
+      "body_low" -- the candle's body low, i.e. min(open, close) -- for a
+                 green candle this is just `open`. Ignores any lower wick
+                 entirely, so the resulting SL sits tighter (closer to
+                 price) whenever the candle has a lower wick below its open."""
+    if sl_basis == "body_low":
+        return min(bar["open"], bar["close"])
+    return bar["low"]
+
+
+def _raw_candle_sl(bar: pd.Series, sl_buffer_pct: float, sl_basis: str = "wick_low") -> float:
+    """The plain stop loss a given green candle implies: sl_anchor -
+    sl_buffer_pct of its own body, where sl_anchor is the wick low (default)
+    or the body low, per sl_basis. No max_loss_points cap -- see
+    _entry_candle_sl for the capped version, used only at entry."""
     body = bar["close"] - bar["open"]
-    return bar["low"] - sl_buffer_pct * body
+    return _sl_anchor(bar, sl_basis) - sl_buffer_pct * body
 
 
-def _entry_candle_sl(bar: pd.Series, sl_buffer_pct: float, max_loss_points: float) -> float:
+def _entry_candle_sl(bar: pd.Series, sl_buffer_pct: float, max_loss_points: float, sl_basis: str = "wick_low") -> float:
     """The INITIAL stop loss set at entry, from the signal candle: same as
     _raw_candle_sl, but capped so it's never more than max_loss_points below
     the candle's close (max_loss_points <= 0 disables the cap). This cap
@@ -122,31 +136,34 @@ def _entry_candle_sl(bar: pd.Series, sl_buffer_pct: float, max_loss_points: floa
     oversized initial risk -- it intentionally does NOT apply to later
     trailing updates (see _trail_sl), since those are already only ever
     ratcheting the stop UP in the trade's favor, and re-capping every step
-    would fight that ratchet instead of just guarding the first one."""
-    raw_sl = _raw_candle_sl(bar, sl_buffer_pct)
+    would fight that ratchet instead of just guarding the first one. This
+    cap behaves identically regardless of sl_basis -- it's always measured
+    from the candle's close, not from whichever anchor sl_basis picked."""
+    raw_sl = _raw_candle_sl(bar, sl_buffer_pct, sl_basis)
     if max_loss_points and max_loss_points > 0:
         capped_sl = bar["close"] - max_loss_points
         return max(raw_sl, capped_sl)
     return raw_sl
 
 
-def _trail_sl(open_trade: dict, bar: pd.Series, sl_buffer_pct: float, trail_min_body_points: float) -> None:
+def _trail_sl(open_trade: dict, bar: pd.Series, sl_buffer_pct: float, trail_min_body_points: float, sl_basis: str = "wick_low") -> None:
     """If `bar` is green AND its body is at least trail_min_body_points (a
     minimum size in price points -- trail_min_body_points <= 0 disables this
     check, so every green candle qualifies, same as before), recompute a
-    candidate stop loss (this candle's low - sl_buffer_pct of its own body --
-    no max_loss_points cap; see _entry_candle_sl's docstring for why), and
-    raise the trade's stop to it if -- and only if -- that's actually higher
-    than the current stop. The stop never moves down, so a pullback candle
-    can't drag it back toward the entry. This only looks at the single
-    candle that just closed -- there is no multi-candle lookback here, by
-    design: the trailing stop always follows just the previous candle."""
+    candidate stop loss (this candle's sl_anchor - sl_buffer_pct of its own
+    body -- no max_loss_points cap; see _entry_candle_sl's docstring for
+    why), and raise the trade's stop to it if -- and only if -- that's
+    actually higher than the current stop. The stop never moves down, so a
+    pullback candle can't drag it back toward the entry. This only looks at
+    the single candle that just closed -- there is no multi-candle lookback
+    here, by design: the trailing stop always follows just the previous
+    candle."""
     if bar["close"] <= bar["open"]:
         return
     body = bar["close"] - bar["open"]
     if trail_min_body_points and trail_min_body_points > 0 and body < trail_min_body_points:
         return
-    candidate_sl = _raw_candle_sl(bar, sl_buffer_pct)
+    candidate_sl = _raw_candle_sl(bar, sl_buffer_pct, sl_basis)
     if candidate_sl > open_trade["sl_price"]:
         open_trade["sl_price"] = candidate_sl
 
@@ -167,8 +184,21 @@ def run_candle_breakout_backtest(
     max_loss_points: float = 0.0,
     trail_min_body_points: float = 0.0,
     entry_cutoff=None,
+    sl_basis: str = "wick_low",
+    require_new_day_high_after_loss: bool = False,
 ) -> pd.DataFrame:
     """
+    sl_basis controls what the sl_buffer_pct offset is measured down from,
+    for BOTH the initial entry stop and every trailing update:
+      "wick_low" -- the candle's actual low, wick included (default,
+                    original/unchanged behavior).
+      "body_low" -- the candle's body low, i.e. min(open, close) (= open,
+                    for a green candle). Ignores any lower wick, so the
+                    resulting stop sits tighter (closer to price) whenever
+                    the candle has a lower wick below its open. The 20-point
+                    max_loss_points cap at entry is completely unaffected --
+                    it's always measured from the candle's close either way.
+
     body_filter_mode controls how the two decisive-body checks (relative %
     of recent average body, and the absolute points floor) combine:
       "relative" -- only the % of average body check applies (min_body_points ignored)
@@ -218,6 +248,23 @@ def run_candle_breakout_backtest(
     no cutoff at all. The cutoff stops the strategy from looking for a NEW
     position on a symbol once its window has passed -- it never forces an
     existing position closed just because the window ended.
+
+    require_new_day_high_after_loss -- after the FIRST losing trade on a
+    given calendar day (any exit with pnl_points < 0 -- sl, day_square_off,
+    or eod_no_exit, not just an "sl"-tagged exit), every later signal that
+    same day must clear an extra bar before it's allowed to fire: the
+    signal candle's CLOSE must be strictly above the highest HIGH made by
+    any candle so far that day (tracked from the day's first candle,
+    updated every bar, independent of in_session/time_start/time_end).
+    A signal candle that is green and decisive but whose close does not
+    clear that day-high-so-far is negated outright -- no order is placed,
+    and the strategy keeps evaluating later candles under this same
+    stricter rule for the rest of the day (it does not fall back to the
+    plain rule after one skip). The day's first trade is never subject to
+    this -- it only starts applying once a loss has actually happened.
+    Resets (day_had_loss cleared, day-high tracking restarted) on every
+    new calendar day found in `df`. Default False: unchanged original
+    behavior (every decisive green candle signals, all day).
     """
     if body_filter_mode not in ("relative", "absolute", "and", "or"):
         raise ValueError(f"body_filter_mode must be one of 'relative', 'absolute', "
@@ -230,6 +277,11 @@ def run_candle_breakout_backtest(
     open_trade = None
     pending = None
     avg_body = rolling_avg_body(df, body_lookback_candles)
+
+    # -- require_new_day_high_after_loss state (see docstring) --
+    current_day = None   # calendar date of the day currently being tracked
+    day_high = None       # highest `high` seen so far today, updated every bar
+    day_had_loss = False  # set once any trade closes at a loss (pnl < 0) today
 
     def _record_exit(exit_price, exit_reason, exit_bar):
         pnl = exit_price - open_trade["entry_price"]
@@ -254,14 +306,23 @@ def run_candle_breakout_backtest(
         bar = df.iloc[i]
         day_cutoff_hit = time_end is not None and bar["datetime"].time() >= time_end
 
+        if require_new_day_high_after_loss:
+            bar_date = bar["datetime"].date()
+            if bar_date != current_day:
+                current_day = bar_date
+                day_high = None
+                day_had_loss = False
+
         # 1) manage an already-open trade first (entered on an earlier bar)
         if open_trade is not None:
             exit_price, exit_reason = _check_exit(open_trade, bar, i, max_hold_bars)
             if exit_price is not None:
                 _record_exit(exit_price, exit_reason, bar)
                 open_trade = None
+                if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
+                    day_had_loss = True
             elif exit_mode == "trailing":
-                _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points)
+                _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points, sl_basis)
 
         # 2) check whether a pending order fills on THIS bar -- it is only
         #    ever checked once, on the single bar right after the green
@@ -285,8 +346,10 @@ def run_candle_breakout_backtest(
                     if exit_price is not None:
                         _record_exit(exit_price, exit_reason, bar)
                         open_trade = None
+                        if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
+                            day_had_loss = True
                     elif exit_mode == "trailing":
-                        _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points)
+                        _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points, sl_basis)
                 pending = None  # filled or expired -- gone either way, never carries forward
             elif i > pending["valid_bar"]:
                 pending = None
@@ -299,6 +362,8 @@ def run_candle_breakout_backtest(
             if open_trade is not None:
                 _record_exit(bar["close"], "day_square_off", bar)
                 open_trade = None
+                if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
+                    day_had_loss = True
             pending = None
 
         # 3) at the close of this candle, look for a fresh green-candle setup
@@ -325,9 +390,16 @@ def run_candle_breakout_backtest(
             else:  # "and"
                 is_decisive = passes_relative and passes_absolute
 
-            if body > 0 and is_decisive:
+            passes_day_high_reentry = (
+                not require_new_day_high_after_loss
+                or not day_had_loss
+                or day_high is None
+                or bar["close"] > day_high
+            )
+
+            if body > 0 and is_decisive and passes_day_high_reentry:
                 buy_limit_price = bar["close"] + buy_limit_pct * body
-                sl_price = _entry_candle_sl(bar, sl_buffer_pct, max_loss_points)
+                sl_price = _entry_candle_sl(bar, sl_buffer_pct, max_loss_points, sl_basis)
                 risk = buy_limit_price - sl_price
                 if risk > 0:
                     target_price = None if exit_mode == "trailing" else buy_limit_price + reward_risk * risk
@@ -339,6 +411,9 @@ def run_candle_breakout_backtest(
                         "valid_bar": i + 1,
                         "candle_datetime": bar["datetime"],
                     }
+
+        if require_new_day_high_after_loss:
+            day_high = bar["high"] if day_high is None else max(day_high, bar["high"])
 
     # If a trade is still open when the data simply runs out (never hit SL,
     # target, or the max-hold cutoff), close it at the last bar's close

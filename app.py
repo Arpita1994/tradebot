@@ -210,8 +210,22 @@ if source == "ATM Options (current month, live)":
                  "calculation would otherwise put it further away (guards against one "
                  "wicky entry candle creating an oversized risk). Applies ONLY to the "
                  "initial entry stop -- later trailing updates are left uncapped, since "
-                 "the trailing ratchet only ever moves the stop up anyway. 0 disables it."
+                 "the trailing ratchet only ever moves the stop up anyway. 0 disables it. "
+                 "This cap is unaffected by the SL basis setting below -- it's always "
+                 "measured from the candle's close either way."
         )
+        atm_sl_basis_label = st.sidebar.radio(
+            "Stop loss basis", ["Wick low (current live config)", "Body low (open, for a green candle)"],
+            key="atm_sl_basis",
+            help="What the % of body offset above is measured DOWN FROM. 'Wick low' "
+                 "(the default, and what's currently running live) uses the candle's "
+                 "actual low, wick included. 'Body low' ignores any lower wick and uses "
+                 "min(open, close) instead -- for a green candle that's just its open -- "
+                 "so the resulting stop sits tighter (closer to price) on any candle "
+                 "with a lower wick. Applies to BOTH the initial entry stop and every "
+                 "trailing update; the max-loss cap above is unaffected either way."
+        )
+        atm_sl_basis = "body_low" if atm_sl_basis_label.startswith("Body low") else "wick_low"
 
         if atm_exit_mode == "target":
             atm_rr = st.sidebar.slider("Reward:Risk multiple", 0.5, 5.0, 2.0, 0.5, key="atm_rr_bo")
@@ -269,6 +283,23 @@ if source == "ATM Options (current month, live)":
             )
         else:
             atm_min_body_pts = 0.0  # unused in this mode
+
+        st.sidebar.header("5. Strategy version")
+        atm_strategy_version = st.sidebar.radio(
+            "Version",
+            ["v1 (original)", "v2 (day-high-after-loss filter)"],
+            index=0, key="atm_strategy_version",
+            help="v1: unchanged original behavior -- every decisive green candle signals, "
+                 "all day, regardless of earlier trades' results. "
+                 "v2: adds a re-entry filter -- once any trade that day closes at a loss, "
+                 "every later signal candle that day must CLOSE above the highest high "
+                 "made by any candle so far that day, or it's skipped entirely (no order "
+                 "placed); the strategy keeps watching later candles under this same "
+                 "stricter rule for the rest of the day. The day's first trade is never "
+                 "affected either way. Matches the git tags v1/v2 in the repo -- this "
+                 "selector switches between them live, with no restart needed."
+        )
+        atm_day_high_after_loss = atm_strategy_version.startswith("v2")
     else:
         st.sidebar.header("3. Lookback & trend")
         atm_lookback = st.sidebar.number_input("Lookback time (bars)", 5, 200, 20, key="atm_lb")
@@ -334,6 +365,8 @@ if source == "ATM Options (current month, live)":
                 exit_mode=atm_exit_mode,
                 max_loss_points=float(atm_max_loss_points),
                 trail_min_body_points=float(atm_trail_min_body),
+                sl_basis=atm_sl_basis,
+                require_new_day_high_after_loss=bool(atm_day_high_after_loss),
             )
             with st.spinner("Running per-window backtests..."):
                 window_df, combined = run_legs_candle_breakout(
