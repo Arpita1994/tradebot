@@ -82,6 +82,8 @@ feed; this function does not do that on its own.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 
 from core.indicators import rolling_avg_body
@@ -104,6 +106,19 @@ def _check_exit(open_trade: dict, bar: pd.Series, bar_index: int, max_hold_bars:
     if bar_index - open_trade["entry_bar_index"] >= max_hold_bars:
         return bar["close"], "eod_no_exit"
     return None, None
+
+
+def _peak_high_datetime(df: pd.DataFrame, entry_bar_index: int, exit_bar_index: int):
+    """For require_close_above_loss_reference: finds the datetime of
+    whichever bar had the highest `high` during a trade's ENTIRE lifetime,
+    from its entry/fill bar through its exit bar (inclusive on both ends
+    -- entry_bar_index == exit_bar_index for a same-candle fill-then-exit
+    is just that one bar). This is NOT necessarily the entry bar itself --
+    a trade can run for several candles before reversing, and the
+    reference is wherever price actually peaked during the whole ride."""
+    window = df.iloc[entry_bar_index:exit_bar_index + 1]
+    peak_idx = window["high"].idxmax()
+    return df.loc[peak_idx, "datetime"]
 
 
 def _sl_anchor(bar: pd.Series, sl_basis: str) -> float:
@@ -185,7 +200,11 @@ def run_candle_breakout_backtest(
     trail_min_body_points: float = 0.0,
     entry_cutoff=None,
     sl_basis: str = "wick_low",
-    require_new_day_high_after_loss: bool = False,
+    require_close_above_loss_reference: bool = False,
+    entry_floor=None,
+    initial_day: dt.date | None = None,
+    initial_loss_active: bool = False,
+    initial_loss_ref_time=None,
 ) -> pd.DataFrame:
     """
     sl_basis controls what the sl_buffer_pct offset is measured down from,
@@ -249,22 +268,70 @@ def run_candle_breakout_backtest(
     position on a symbol once its window has passed -- it never forces an
     existing position closed just because the window ended.
 
-    require_new_day_high_after_loss -- after the FIRST losing trade on a
-    given calendar day (any exit with pnl_points < 0 -- sl, day_square_off,
-    or eod_no_exit, not just an "sl"-tagged exit), every later signal that
-    same day must clear an extra bar before it's allowed to fire: the
-    signal candle's CLOSE must be strictly above the highest HIGH made by
-    any candle so far that day (tracked from the day's first candle,
-    updated every bar, independent of in_session/time_start/time_end).
-    A signal candle that is green and decisive but whose close does not
-    clear that day-high-so-far is negated outright -- no order is placed,
-    and the strategy keeps evaluating later candles under this same
-    stricter rule for the rest of the day (it does not fall back to the
-    plain rule after one skip). The day's first trade is never subject to
-    this -- it only starts applying once a loss has actually happened.
-    Resets (day_had_loss cleared, day-high tracking restarted) on every
-    new calendar day found in `df`. Default False: unchanged original
-    behavior (every decisive green candle signals, all day).
+    require_close_above_loss_reference -- a "loss-recovery loop" for the
+    rest of a calendar day, triggered by a losing trade and broken by a
+    winning one:
+
+      1. Whenever a trade closes at a loss (pnl_points < 0 -- any exit
+         reason: sl, day_square_off, or eod_no_exit), the loop STARTS (or,
+         if already running, its reference REFRESHES): find whichever bar
+         had the HIGHEST high during that losing trade's ENTIRE lifetime,
+         from its entry/fill bar through its exit bar (inclusive both
+         ends -- see _peak_high_datetime) -- not necessarily the entry bar
+         itself, since a trade can run for several candles before
+         reversing, and price may have peaked partway through the ride,
+         not right at entry. Remember that peak bar's datetime. Call this
+         loss_ref_time.
+      2. While the loop is running, every later green/decisive candle must
+         pass one extra check before it's allowed to signal: look up the
+         candle at loss_ref_time (on THIS SAME symbol's own price data --
+         see entry_floor/initial_loss_ref_time below for what happens
+         across a strike roll) and require the new candidate's CLOSE to be
+         strictly above THAT ONE candle's HIGH. Fails -> negated outright,
+         no order, and the loop keeps running for the next candle (it does
+         not fall back to the plain rule after one skip). If no candle
+         exists at exactly loss_ref_time in this data (e.g. a data gap),
+         the check can't be evaluated and is treated as a pass rather than
+         silently blocking forever on a data problem.
+      3. The loop BREAKS the moment any trade taken under it (or, per (1),
+         even the original triggering loss's very next trade) closes at a
+         WIN (pnl_points >= 0) -- back to the plain rule with no
+         restriction, until another loss starts a fresh loop. A trade that
+         loses again while the loop is already running does NOT break it
+         -- it refreshes loss_ref_time to ITS OWN peak-high bar instead
+         (the most recent loss is always what later candles are measured
+         against).
+      4. The loop, and loss_ref_time, are cleared at every new calendar day
+         found in `df` -- a new day always starts clean, loop only (re)starts
+         once that day has its own loss.
+
+    Default False: unchanged original behavior, no restriction at all.
+
+    entry_floor -- if given (a pandas-comparable timestamp), no NEW signal
+    is generated for a candle whose datetime is < entry_floor, though
+    earlier bars (if present in `df`) are still used for lookups like the
+    loss-reference check above and the rolling body average. This is for
+    the ATM-options caller: when a strike has just rolled and the new
+    leg's own reference candle (loss_ref_time from BEFORE the roll) needs
+    to be read off this new symbol's data, the caller may hand this
+    function extra bars from earlier that same day purely so that lookup
+    has something to read -- entry_floor (the leg's real window_start)
+    stops those extra early bars from being treated as tradeable
+    candles in their own right.
+
+    initial_day / initial_loss_active / initial_loss_ref_time -- seeds the
+    loop's state from a PRIOR call (e.g. an earlier leg on the same
+    option_type, before an ATM strike roll), so the loop can correctly
+    keep running across a strike change within the same calendar day even
+    though each leg/strike runs as its own separate call to this function.
+    If `df`'s first bar is on a different calendar day than `initial_day`,
+    the normal same-day-boundary reset logic fires immediately and clears
+    everything anyway, exactly as if this were a fresh day. The caller
+    reads back the ending state via the returned DataFrame's
+    `.attrs["ending_day"]` / `.attrs["ending_loss_active"]` /
+    `.attrs["ending_loss_ref_time"]` to pass into the NEXT chronological
+    leg of the same option_type (see run_legs_candle_breakout in
+    atm_options.py).
     """
     if body_filter_mode not in ("relative", "absolute", "and", "or"):
         raise ValueError(f"body_filter_mode must be one of 'relative', 'absolute', "
@@ -278,10 +345,12 @@ def run_candle_breakout_backtest(
     pending = None
     avg_body = rolling_avg_body(df, body_lookback_candles)
 
-    # -- require_new_day_high_after_loss state (see docstring) --
-    current_day = None   # calendar date of the day currently being tracked
-    day_high = None       # highest `high` seen so far today, updated every bar
-    day_had_loss = False  # set once any trade closes at a loss (pnl < 0) today
+    # -- require_close_above_loss_reference state (see docstring) --
+    current_day = initial_day            # calendar date of the day currently being tracked
+    loss_active = initial_loss_active    # is the loss-recovery loop currently running?
+    loss_ref_time = initial_loss_ref_time  # datetime of the PEAK-HIGH bar during the most
+                                            # recent losing trade's lifetime -- later candles must
+                                            # close above THAT candle's high
 
     def _record_exit(exit_price, exit_reason, exit_bar):
         pnl = exit_price - open_trade["entry_price"]
@@ -306,21 +375,25 @@ def run_candle_breakout_backtest(
         bar = df.iloc[i]
         day_cutoff_hit = time_end is not None and bar["datetime"].time() >= time_end
 
-        if require_new_day_high_after_loss:
+        if require_close_above_loss_reference:
             bar_date = bar["datetime"].date()
             if bar_date != current_day:
                 current_day = bar_date
-                day_high = None
-                day_had_loss = False
+                loss_active = False
+                loss_ref_time = None
 
         # 1) manage an already-open trade first (entered on an earlier bar)
         if open_trade is not None:
             exit_price, exit_reason = _check_exit(open_trade, bar, i, max_hold_bars)
             if exit_price is not None:
+                entry_bar_idx = open_trade["entry_bar_index"]
                 _record_exit(exit_price, exit_reason, bar)
                 open_trade = None
-                if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
-                    day_had_loss = True
+                if require_close_above_loss_reference:
+                    if trades[-1]["pnl_points"] < 0:
+                        loss_active, loss_ref_time = True, _peak_high_datetime(df, entry_bar_idx, i)
+                    else:
+                        loss_active, loss_ref_time = False, None
             elif exit_mode == "trailing":
                 _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points, sl_basis)
 
@@ -346,8 +419,12 @@ def run_candle_breakout_backtest(
                     if exit_price is not None:
                         _record_exit(exit_price, exit_reason, bar)
                         open_trade = None
-                        if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
-                            day_had_loss = True
+                        if require_close_above_loss_reference:
+                            if trades[-1]["pnl_points"] < 0:
+                                # same-bar fill-then-exit -- entry and exit are this one bar
+                                loss_active, loss_ref_time = True, _peak_high_datetime(df, i, i)
+                            else:
+                                loss_active, loss_ref_time = False, None
                     elif exit_mode == "trailing":
                         _trail_sl(open_trade, bar, sl_buffer_pct, trail_min_body_points, sl_basis)
                 pending = None  # filled or expired -- gone either way, never carries forward
@@ -360,10 +437,14 @@ def run_candle_breakout_backtest(
         # order is also dropped here rather than left to fill tomorrow.
         if day_cutoff_hit:
             if open_trade is not None:
+                entry_bar_idx = open_trade["entry_bar_index"]
                 _record_exit(bar["close"], "day_square_off", bar)
                 open_trade = None
-                if require_new_day_high_after_loss and trades[-1]["pnl_points"] < 0:
-                    day_had_loss = True
+                if require_close_above_loss_reference:
+                    if trades[-1]["pnl_points"] < 0:
+                        loss_active, loss_ref_time = True, _peak_high_datetime(df, entry_bar_idx, i)
+                    else:
+                        loss_active, loss_ref_time = False, None
             pending = None
 
         # 3) at the close of this candle, look for a fresh green-candle setup
@@ -372,9 +453,10 @@ def run_candle_breakout_backtest(
             t = bar["datetime"].time()
             in_session = time_start <= t <= time_end
         before_cutoff = entry_cutoff is None or bar["datetime"] < entry_cutoff
+        after_floor = entry_floor is None or bar["datetime"] >= entry_floor
         is_green = bar["close"] > bar["open"]
 
-        if (is_green and in_session and before_cutoff and not day_cutoff_hit
+        if (is_green and in_session and before_cutoff and after_floor and not day_cutoff_hit
                 and open_trade is None and pending is None and i + 1 < n):
             body = bar["close"] - bar["open"]
             bar_avg_body = avg_body.iloc[i]
@@ -390,14 +472,17 @@ def run_candle_breakout_backtest(
             else:  # "and"
                 is_decisive = passes_relative and passes_absolute
 
-            passes_day_high_reentry = (
-                not require_new_day_high_after_loss
-                or not day_had_loss
-                or day_high is None
-                or bar["close"] > day_high
-            )
+            passes_loss_reference = True
+            if require_close_above_loss_reference and loss_active and loss_ref_time is not None:
+                ref_rows = df[df["datetime"] == loss_ref_time]
+                if not ref_rows.empty:
+                    passes_loss_reference = bar["close"] > ref_rows.iloc[0]["high"]
+                # else: no candle found at loss_ref_time in this data (e.g. a gap, or
+                # this symbol's fetched history doesn't reach back that far) -- can't
+                # evaluate the check, so don't silently block on a data problem; leave
+                # passes_loss_reference True.
 
-            if body > 0 and is_decisive and passes_day_high_reentry:
+            if body > 0 and is_decisive and passes_loss_reference:
                 buy_limit_price = bar["close"] + buy_limit_pct * body
                 sl_price = _entry_candle_sl(bar, sl_buffer_pct, max_loss_points, sl_basis)
                 risk = buy_limit_price - sl_price
@@ -412,15 +497,28 @@ def run_candle_breakout_backtest(
                         "candle_datetime": bar["datetime"],
                     }
 
-        if require_new_day_high_after_loss:
-            day_high = bar["high"] if day_high is None else max(day_high, bar["high"])
-
     # If a trade is still open when the data simply runs out (never hit SL,
     # target, or the max-hold cutoff), close it at the last bar's close
     # instead of silently dropping it -- same "eod_no_exit" convention as
     # the consolidation-box engine's run_backtest().
     if open_trade is not None and n > 0:
         last_bar = df.iloc[n - 1]
+        entry_bar_idx = open_trade["entry_bar_index"]
         _record_exit(last_bar["close"], "eod_no_exit", last_bar)
+        if require_close_above_loss_reference:
+            if trades[-1]["pnl_points"] < 0:
+                loss_active, loss_ref_time = True, _peak_high_datetime(df, entry_bar_idx, n - 1)
+            else:
+                loss_active, loss_ref_time = False, None
 
-    return pd.DataFrame(trades)
+    result = pd.DataFrame(trades)
+    # Ending loop state, for a caller running consecutive legs (per
+    # option_type, across ATM strike rolls) to carry into the NEXT leg's
+    # initial_day/initial_loss_active/initial_loss_ref_time -- see this
+    # function's docstring and run_legs_candle_breakout in atm_options.py.
+    # Set unconditionally (cheap, harmless) so the caller doesn't need to
+    # know in advance whether this particular leg had any bars at all.
+    result.attrs["ending_day"] = current_day
+    result.attrs["ending_loss_active"] = loss_active
+    result.attrs["ending_loss_ref_time"] = loss_ref_time
+    return result

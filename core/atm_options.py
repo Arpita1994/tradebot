@@ -38,6 +38,7 @@ no separate download step, no local file to keep in sync.
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import pandas as pd
 
@@ -47,21 +48,42 @@ from core.backtest import run_backtest
 from core.candle_breakout import run_candle_breakout_backtest
 from core.metrics import summarize
 
-SYMBOL_PREFIX = "CRUDEOILM"  # Mini Crude Oil (lot size 10 bbl), per your Fyers screenshot --
-                              # NOT the standard CRUDEOIL contract (lot size 100 bbl) this
-                              # tool originally targeted. Different expiry calendar too
-                              # (e.g. 17 Sept / 15 Oct / 17 Nov 2026), which is exactly why
-                              # compute_current_option_month() below asks Fyers directly
-                              # instead of assuming any fixed day-of-month.
-STRIKE_STEP = 50            # ASSUMED, NOT CONFIRMED for CRUDEOILM -- carried over from the
-                              # standard CRUDEOIL contract's confirmed spacing. Your screenshot
-                              # only showed one strike (10000), which is consistent with either
-                              # a 50 or 100 step, so this could be wrong. Please check the
-                              # "Option Chain" tab on Fyers for CRUDEOILM and confirm the actual
-                              # gap between adjacent listed strikes, then update this if it's
-                              # not 50 -- an incorrect step means nearest_strike() will often
-                              # compute a strike that isn't actually listed, which shows up as
-                              # a "no_data" leg exactly like the expired-contract issue did.
+# --- Underlying contract selector -----------------------------------------
+# Set OPTIONS_EXCHANGE=NSE in .env (or the environment) to switch the whole
+# ATM-options backtest from MCX's mini Crude Oil contract to NSE's WTI Crude
+# Oil contract. Everything below (symbol prefix, exchange, strike step) is
+# derived from this one switch so testing NSE and rolling back to MCX is a
+# single env-var flip, same pattern as CANDLE_MINUTES in live_engine.py.
+#
+# MCX CRUDEOILM (mini): lot size 10 bbl, per Fyers screenshot, e.g. contract
+#   month codes like 17SEP/15OCT/17NOV (MCX's own irregular expiry calendar
+#   -- exactly why compute_current_option_month() below asks Fyers directly
+#   instead of assuming any fixed day-of-month).
+# NSE CRUDEOIL (WTI, "NSE CRUDE" tab in Fyers): lot size 100 bbl (qty=1 =
+#   100 barrels, confirmed from Fyers' own order ticket), options expire 2
+#   business days before the underlying future's expiry (per NSE's circular)
+#   -- also handled automatically since compute_current_option_month() never
+#   hardcodes an expiry day, it just probes Fyers.
+#   CONFIRMED against a live Fyers option chain screenshot: strike step 50,
+#   option symbol format "CRUDEOIL26OCT8900CE" (no day-of-month -- matches
+#   month_code()'s existing YY+MMM output exactly, no format change needed).
+#   NOT YET CONFIRMED: the underlying FUTURES symbol used by fetch_underlying()
+#   below -- "NSE:CRUDEOIL{mcode}FUT" is an assumption by analogy with MCX's
+#   pattern, not verified against a real Fyers futures symbol. If it's wrong,
+#   compute_current_option_month()'s validity probe will fail every month and
+#   silently fall through to returning the current month's code anyway
+#   (see its docstring) rather than raising a clear error -- confirm this
+#   symbol against Fyers before trusting NSE backtest results.
+OPTIONS_EXCHANGE = os.getenv("OPTIONS_EXCHANGE", "MCX")  # "MCX" or "NSE"
+SYMBOL_PREFIX = "CRUDEOIL" if OPTIONS_EXCHANGE == "NSE" else "CRUDEOILM"
+STRIKE_STEP = 50            # CONFIRMED 50 for BOTH: MCX CRUDEOILM (against Fyers' Option
+                              # Chain, e.g. ...5700, 5750, 5800...) and NSE CRUDEOIL (against
+                              # a live Fyers NSE CRUDE option chain screenshot, e.g. ...8850,
+                              # 8900, 8950...). If either exchange ever changes its strike
+                              # spacing, re-check Fyers' Option Chain and update this -- an
+                              # incorrect step means nearest_strike() will compute a strike
+                              # that isn't actually listed, which shows up as a "no_data" leg
+                              # in backtests and a rejected order in live trading.
 MAX_MONTHS_TO_PROBE = 4     # safety cap so a persistent API problem can't loop forever
 
 
@@ -102,7 +124,7 @@ def compute_current_option_month(app_id: str, access_token: str,
     year, month = today.year, today.month
     for _ in range(MAX_MONTHS_TO_PROBE):
         mcode = month_code(year, month)
-        if _symbol_is_valid(app_id, access_token, f"MCX:{SYMBOL_PREFIX}{mcode}FUT"):
+        if _symbol_is_valid(app_id, access_token, f"{OPTIONS_EXCHANGE}:{SYMBOL_PREFIX}{mcode}FUT"):
             return year, month, mcode
         year, month = _add_months(year, month, 1)
     # Fell through without a hit -- most likely an auth/connectivity problem
@@ -142,7 +164,7 @@ def fetch_underlying(app_id: str, access_token: str, mcode: str,
     though the symbol names the CURRENT contract month."""
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=lookback_days)
-    symbol = f"MCX:{SYMBOL_PREFIX}{mcode}FUT"
+    symbol = f"{OPTIONS_EXCHANGE}:{SYMBOL_PREFIX}{mcode}FUT"
     df = fetch_history(
         symbol=symbol, resolution=resolution,
         start_date=start_date.isoformat(), end_date=end_date.isoformat(),
@@ -192,7 +214,7 @@ def build_legs(underlying: pd.DataFrame, mcode: str, option_types: list[str],
                 continue
             ref_price = float(ref_rows.iloc[-1]["close"])
             strike = nearest_strike(ref_price, strike_step)
-            symbol = f"MCX:{SYMBOL_PREFIX}{mcode}{strike}{opt}"
+            symbol = f"{OPTIONS_EXCHANGE}:{SYMBOL_PREFIX}{mcode}{strike}{opt}"
 
             if current is not None and current["symbol"] == symbol:
                 # Same strike still ATM -- extend the running leg instead of
@@ -219,7 +241,8 @@ def build_legs(underlying: pd.DataFrame, mcode: str, option_types: list[str],
 
 
 def _fetch_leg_df(leg: dict, app_id: str, access_token: str, resolution: str,
-                   fetch_cache: dict, fetch_end: dt.datetime | None = None) -> pd.DataFrame | None:
+                   fetch_cache: dict, fetch_end: dt.datetime | None = None,
+                   clip_start_override: dt.datetime | None = None) -> pd.DataFrame | None:
     """Shared per-leg fetch used by every strategy runner below: pulls (and
     caches, per symbol+day-range, so a strike carried across consecutive
     windows isn't re-fetched) the option's candles, timezone-normalizes them,
@@ -232,13 +255,26 @@ def _fetch_leg_df(leg: dict, app_id: str, access_token: str, resolution: str,
     the window ends can keep being tracked, on this same symbol's data,
     all the way to its own natural exit (see candle_breakout's
     entry_cutoff). Without it (the default), behavior is unchanged: clipped
-    to the leg's own window."""
+    to the leg's own window.
+
+    clip_start_override, if given (and earlier than leg["window_start"]),
+    lowers the clip's LOWER bound too -- used by run_legs_candle_breakout's
+    require_close_above_loss_reference support so a leg's data can include
+    bars from BEFORE this leg's own window_start, back to an earlier loss's
+    reference candle time on a prior strike. fetch_history is already
+    queried with whole-day start/end dates (not exact times), so the
+    underlying day_df already contains those earlier bars -- only the
+    final clip's lower bound needs adjusting; no extra API call is made.
+    The strategy call itself still gets entry_floor=leg["window_start"] so
+    these extra early bars are read-only lookups, never tradeable candles
+    in their own right."""
     clip_end = max(leg["window_end"], fetch_end) if fetch_end is not None else leg["window_end"]
-    key = (leg["symbol"], leg["window_start"].date(), clip_end.date())
+    clip_start = min(leg["window_start"], clip_start_override) if clip_start_override is not None else leg["window_start"]
+    key = (leg["symbol"], clip_start.date(), clip_end.date())
     if key not in fetch_cache:
         fetch_cache[key] = fetch_history(
             symbol=leg["symbol"], resolution=resolution,
-            start_date=leg["window_start"].date().isoformat(),
+            start_date=clip_start.date().isoformat(),
             end_date=clip_end.date().isoformat(),
             access_token=access_token, app_id=app_id,
         )
@@ -249,7 +285,7 @@ def _fetch_leg_df(leg: dict, app_id: str, access_token: str, resolution: str,
     if day_df["datetime"].dt.tz is not None:
         day_df = day_df.copy()
         day_df["datetime"] = day_df["datetime"].dt.tz_localize(None)
-    return day_df[(day_df["datetime"] >= leg["window_start"].replace(tzinfo=None))
+    return day_df[(day_df["datetime"] >= clip_start.replace(tzinfo=None))
                   & (day_df["datetime"] <= clip_end.replace(tzinfo=None))].reset_index(drop=True)
 
 
@@ -322,15 +358,47 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
     natural exit -- SL, target/trailing stop, the max-hold cutoff, or truly
     running out of data. build_legs() already merges consecutive
     same-strike windows into one leg, so this only ever creates a genuine
-    cutoff at an actual strike roll."""
+    cutoff at an actual strike roll.
+
+    require_close_above_loss_reference (if set in breakout_kwargs): CE and
+    PE each run their OWN independent loss-recovery loop (see
+    candle_breakout.run_candle_breakout_backtest's docstring for the full
+    rule) across a strike roll within the same calendar day -- e.g. a CE
+    loss on the 9150 strike keeps the loop running for the very next CE
+    signal after the strike has rolled to 8950, even though that's a
+    separate leg/call. CE and PE never affect each other. What carries
+    across the roll is only WHETHER the loop is active and WHEN the
+    triggering loss's peak-high bar was (loss_ref_time -- the bar with the
+    highest high during that losing trade's entire lifetime, entry through
+    exit, not necessarily the entry bar itself) -- never a price
+    level itself, since a different strike's premium isn't a comparable
+    scale. To let the new leg actually read that reference candle (which
+    may fall before this leg's own window_start, from before the roll),
+    this fetches each leg's data with its clip's lower bound pulled back
+    to cover loss_ref_time when a loop is carrying in, while still passing
+    entry_floor=window_start to the strategy call so those extra early
+    bars are lookup-only, never tradeable in their own right. legs is
+    already sorted chronologically (build_legs sorts by window_start,
+    option_type), so processing them in order and keeping one carry-state
+    dict per option_type is enough to thread this correctly."""
     fetch_cache: dict = {}
     all_trades = []
     window_results = []
+    # option_type -> {"day": date|None, "loss_active": bool, "loss_ref_time": Timestamp|None}
+    day_carry: dict[str, dict] = {}
 
     for n, leg in enumerate(legs, start=1):
+        carried = day_carry.get(leg["option_type"], {"day": None, "loss_active": False, "loss_ref_time": None})
+        clip_start_override = None
+        if (carried["loss_active"] and carried["loss_ref_time"] is not None
+                and carried["day"] == leg["window_start"].date()
+                and carried["loss_ref_time"] < leg["window_start"]):
+            clip_start_override = carried["loss_ref_time"]
+
         try:
             df = _fetch_leg_df(leg, app_id, access_token, resolution, fetch_cache,
-                                fetch_end=leg.get("fetch_until"))
+                                fetch_end=leg.get("fetch_until"),
+                                clip_start_override=clip_start_override)
         except Exception as e:
             window_results.append({**leg, "status": "no_data", "error": str(e), "rows": 0,
                                     "trades": 0, "pnl_points": None, "win_rate_pct": None})
@@ -347,8 +415,20 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
 
         trades = run_candle_breakout_backtest(
             df, time_start=time_start, time_end=time_end,
-            entry_cutoff=leg["window_end"].replace(tzinfo=None), **breakout_kwargs,
+            entry_cutoff=leg["window_end"].replace(tzinfo=None),
+            entry_floor=leg["window_start"].replace(tzinfo=None),
+            initial_day=carried["day"], initial_loss_active=carried["loss_active"],
+            initial_loss_ref_time=carried["loss_ref_time"],
+            **breakout_kwargs,
         )
+        # Carry this leg's ending loop state forward to the NEXT leg of the
+        # SAME option_type (read from .attrs before .copy() below, since
+        # .attrs isn't guaranteed to survive every DataFrame operation).
+        day_carry[leg["option_type"]] = {
+            "day": trades.attrs.get("ending_day"),
+            "loss_active": trades.attrs.get("ending_loss_active", False),
+            "loss_ref_time": trades.attrs.get("ending_loss_ref_time"),
+        }
 
         if not trades.empty:
             trades = trades.copy()

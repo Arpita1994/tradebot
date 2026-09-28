@@ -287,16 +287,23 @@ if source == "ATM Options (current month, live)":
         st.sidebar.header("5. Strategy version")
         atm_strategy_version = st.sidebar.radio(
             "Version",
-            ["v1 (original)", "v2 (day-high-after-loss filter)"],
+            ["v1 (original)", "v2 (loss-recovery reference filter)"],
             index=0, key="atm_strategy_version",
             help="v1: unchanged original behavior -- every decisive green candle signals, "
                  "all day, regardless of earlier trades' results. "
-                 "v2: adds a re-entry filter -- once any trade that day closes at a loss, "
-                 "every later signal candle that day must CLOSE above the highest high "
-                 "made by any candle so far that day, or it's skipped entirely (no order "
-                 "placed); the strategy keeps watching later candles under this same "
-                 "stricter rule for the rest of the day. The day's first trade is never "
-                 "affected either way. Matches the git tags v1/v2 in the repo -- this "
+                 "v2: adds a loss-recovery loop -- whenever a trade closes at a loss, "
+                 "find whichever candle had the HIGHEST high during that losing trade's "
+                 "entire lifetime (entry through exit, not necessarily the entry candle "
+                 "itself). Every later signal candle (CE and PE tracked separately) must "
+                 "then CLOSE above THAT ONE candle's HIGH to be allowed to fire, or it's "
+                 "skipped entirely (no order placed) and the loop keeps running. A win "
+                 "breaks the loop (back to no restriction) until the next loss starts it "
+                 "again; a further loss while the loop is running just refreshes the "
+                 "reference to its own peak-high candle. Carries across an ATM strike "
+                 "roll within the same day (only "
+                 "the loss-active flag and its timestamp carry over, never a price level "
+                 "-- a new strike's own candles are what get compared). Resets fresh "
+                 "every calendar day. Matches the git tags v1/v2 in the repo -- this "
                  "selector switches between them live, with no restart needed."
         )
         atm_day_high_after_loss = atm_strategy_version.startswith("v2")
@@ -366,7 +373,7 @@ if source == "ATM Options (current month, live)":
                 max_loss_points=float(atm_max_loss_points),
                 trail_min_body_points=float(atm_trail_min_body),
                 sl_basis=atm_sl_basis,
-                require_new_day_high_after_loss=bool(atm_day_high_after_loss),
+                require_close_above_loss_reference=bool(atm_day_high_after_loss),
             )
             with st.spinner("Running per-window backtests..."):
                 window_df, combined = run_legs_candle_breakout(
