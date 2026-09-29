@@ -352,6 +352,8 @@ def run_candle_breakout_backtest(
                                             # recent losing trade's lifetime -- later candles must
                                             # close above THAT candle's high
 
+    negated_signals = []
+
     def _record_exit(exit_price, exit_reason, exit_bar):
         pnl = exit_price - open_trade["entry_price"]
         risk = open_trade["risk_points"]
@@ -369,6 +371,12 @@ def run_candle_breakout_backtest(
             "exit_reason": exit_reason,
             "pnl_points": pnl,
             "r_multiple": (pnl / risk) if risk else None,
+            # debug: what the loss-recovery loop looked like AT THE TIME this
+            # trade's own signal candle was evaluated -- so you can verify
+            # from the trade log alone whether/what reference gated this entry.
+            "loss_loop_active_at_entry": open_trade.get("loss_loop_active_at_entry"),
+            "loss_ref_time_at_entry": open_trade.get("loss_ref_time_at_entry"),
+            "loss_ref_high_at_entry": open_trade.get("loss_ref_high_at_entry"),
         })
 
     for i in range(n):
@@ -414,6 +422,9 @@ def run_candle_breakout_backtest(
                         "entry_bar_index": i,
                         "entry_datetime": bar["datetime"],
                         "candle_datetime": pending["candle_datetime"],
+                        "loss_loop_active_at_entry": pending.get("loss_loop_active_at_entry"),
+                        "loss_ref_time_at_entry": pending.get("loss_ref_time_at_entry"),
+                        "loss_ref_high_at_entry": pending.get("loss_ref_high_at_entry"),
                     }
                     exit_price, exit_reason = _check_exit(open_trade, bar, i, max_hold_bars)
                     if exit_price is not None:
@@ -473,14 +484,27 @@ def run_candle_breakout_backtest(
                 is_decisive = passes_relative and passes_absolute
 
             passes_loss_reference = True
+            ref_high_used = None  # debug: the reference candle's high actually compared against, if any
             if require_close_above_loss_reference and loss_active and loss_ref_time is not None:
                 ref_rows = df[df["datetime"] == loss_ref_time]
                 if not ref_rows.empty:
-                    passes_loss_reference = bar["close"] > ref_rows.iloc[0]["high"]
+                    ref_high_used = ref_rows.iloc[0]["high"]
+                    passes_loss_reference = bar["close"] > ref_high_used
                 # else: no candle found at loss_ref_time in this data (e.g. a gap, or
                 # this symbol's fetched history doesn't reach back that far) -- can't
                 # evaluate the check, so don't silently block on a data problem; leave
                 # passes_loss_reference True.
+
+            if body > 0 and is_decisive and not passes_loss_reference:
+                # debug: record the negated signal itself -- otherwise a blocked
+                # candle leaves zero trace anywhere in the output.
+                negated_signals.append({
+                    "candle_datetime": bar["datetime"],
+                    "close": bar["close"],
+                    "loss_ref_time": loss_ref_time,
+                    "loss_ref_high": ref_high_used,
+                    "reason": "close_not_above_loss_reference",
+                })
 
             if body > 0 and is_decisive and passes_loss_reference:
                 buy_limit_price = bar["close"] + buy_limit_pct * body
@@ -495,7 +519,34 @@ def run_candle_breakout_backtest(
                         "risk_points": risk,
                         "valid_bar": i + 1,
                         "candle_datetime": bar["datetime"],
+                        # debug: snapshot of the loss-recovery loop's state AT
+                        # THE MOMENT this signal was generated (not re-evaluated
+                        # later), so the eventual trade record can show exactly
+                        # what gated (or didn't gate) this entry.
+                        "loss_loop_active_at_entry": bool(require_close_above_loss_reference and loss_active),
+                        "loss_ref_time_at_entry": loss_ref_time if (require_close_above_loss_reference and loss_active) else None,
+                        "loss_ref_high_at_entry": ref_high_used,
                     }
+
+        # 4) stop early once there is genuinely nothing left this call could
+        # ever do: no trade open, no pending order, and past entry_cutoff so
+        # no NEW signal can fire either. This matters a lot for the
+        # ATM-options caller: it fetches every leg's data all the way out to
+        # fetch_until (the OVERALL backtest's end, not just this leg's own
+        # window) purely so an open trade can run to its natural exit past
+        # the window boundary -- but without this early stop, the loop would
+        # keep walking through every subsequent day in that padding, and
+        # require_close_above_loss_reference's day-boundary reset (which
+        # fires unconditionally on ANY calendar-day change) would silently
+        # wipe out this leg's real ending loss_active/loss_ref_time by the
+        # time the call returns -- corrupting what gets carried into the
+        # NEXT leg via .attrs, even though nothing of substance happened in
+        # all those extra padding days. Stopping here means the returned
+        # ending state reflects this leg's own last real event, not
+        # whatever calendar day the padding happened to trail off on.
+        if (entry_cutoff is not None and not before_cutoff
+                and open_trade is None and pending is None):
+            break
 
     # If a trade is still open when the data simply runs out (never hit SL,
     # target, or the max-hold cutoff), close it at the last bar's close
@@ -521,4 +572,8 @@ def run_candle_breakout_backtest(
     result.attrs["ending_day"] = current_day
     result.attrs["ending_loss_active"] = loss_active
     result.attrs["ending_loss_ref_time"] = loss_ref_time
+    # debug: every green/decisive candle that was blocked by
+    # require_close_above_loss_reference, with the reference it failed
+    # against -- otherwise a negated signal leaves zero trace anywhere.
+    result.attrs["negated_signals"] = negated_signals
     return result

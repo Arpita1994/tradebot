@@ -384,6 +384,7 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
     fetch_cache: dict = {}
     all_trades = []
     window_results = []
+    all_negated = []  # debug: every negated signal across every leg, with leg context added
     # option_type -> {"day": date|None, "loss_active": bool, "loss_ref_time": Timestamp|None}
     day_carry: dict[str, dict] = {}
 
@@ -429,6 +430,17 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
             "loss_active": trades.attrs.get("ending_loss_active", False),
             "loss_ref_time": trades.attrs.get("ending_loss_ref_time"),
         }
+        # debug: pull this leg's negated signals out (before .copy() below)
+        # and tag each with which leg/symbol it happened on, so a blocked
+        # candle is visible across the WHOLE combined run, not just within
+        # one leg's own isolated call.
+        for neg in trades.attrs.get("negated_signals", []):
+            all_negated.append({
+                **neg,
+                "option_type": leg["option_type"],
+                "leg_symbol": leg["symbol"],
+                "window_start": leg["window_start"],
+            })
 
         if not trades.empty:
             trades = trades.copy()
@@ -443,10 +455,25 @@ def run_legs_candle_breakout(legs: list[dict], app_id: str, access_token: str, r
             "trades": stats["total_trades"],
             "pnl_points": stats["total_pnl_points"],
             "win_rate_pct": stats["win_rate_pct"],
+            # debug: what this leg RECEIVED as its starting loop state (before
+            # this leg's own bars could change anything) and what it handed
+            # OFF to the next leg of the same option_type -- so a broken
+            # cross-leg carry shows up directly in the per-window table
+            # instead of only being inferable from the trade log.
+            "loop_state_received": f"active={carried['loss_active']} ref={carried['loss_ref_time']}",
+            "loop_state_handed_off": (
+                f"active={day_carry[leg['option_type']]['loss_active']} "
+                f"ref={day_carry[leg['option_type']]['loss_ref_time']}"
+            ),
         })
         if progress_callback:
             progress_callback(n, len(legs), leg, "ok")
 
     window_df = pd.DataFrame(window_results)
     combined = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+    # debug: expose every negated signal across the whole run (all legs, both
+    # option types) as a DataFrame on window_df.attrs, so the "why didn't this
+    # candle signal" question is answerable without guessing -- see app.py's
+    # display of this under the ATM Options results.
+    window_df.attrs["negated_signals"] = pd.DataFrame(all_negated) if all_negated else pd.DataFrame()
     return window_df, combined

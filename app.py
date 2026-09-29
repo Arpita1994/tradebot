@@ -400,11 +400,11 @@ if source == "ATM Options (current month, live)":
         progress_bar.empty()
 
         st.subheader("Per-window summary")
-        st.dataframe(
-            window_df[["window_start", "window_end", "option_type", "symbol", "status",
-                       "rows", "trades", "win_rate_pct", "pnl_points"]],
-            use_container_width=True,
-        )
+        window_cols = ["window_start", "window_end", "option_type", "symbol", "status",
+                       "rows", "trades", "win_rate_pct", "pnl_points"]
+        if is_breakout and atm_day_high_after_loss and "loop_state_received" in window_df.columns:
+            window_cols += ["loop_state_received", "loop_state_handed_off"]
+        st.dataframe(window_df[window_cols], use_container_width=True)
 
         if not combined.empty:
             st.subheader("By option type")
@@ -446,9 +446,32 @@ if source == "ATM Options (current month, live)":
             st.dataframe(exit_reason_breakdown(combined), use_container_width=True)
 
             st.subheader("Trade log")
+            if is_breakout and atm_day_high_after_loss:
+                st.caption(
+                    "v2 filter debug columns: 'loss_loop_active_at_entry' -- was the "
+                    "loss-recovery loop running when this trade's signal candle was "
+                    "evaluated; 'loss_ref_time_at_entry' -- which candle's high it had to "
+                    "close above; 'loss_ref_high_at_entry' -- that candle's high. Empty/None "
+                    "means the loop wasn't active for this entry (plain rule, no restriction)."
+                )
             st.dataframe(combined_net, use_container_width=True)
             csv = combined_net.to_csv(index=False).encode("utf-8")
             st.download_button("Download trade log (CSV)", csv, "atm_options_trade_log.csv", "text/csv")
+
+            if is_breakout and atm_day_high_after_loss:
+                negated = window_df.attrs.get("negated_signals", pd.DataFrame())
+                st.subheader("Negated signals (v2 filter)")
+                st.caption(
+                    "Every green/decisive candle that WOULD have signaled but was blocked "
+                    "because its close didn't beat the active loss reference candle's high. "
+                    "These never appear in the trade log above -- this is the only place "
+                    "they're visible."
+                )
+                if negated is not None and not negated.empty:
+                    st.dataframe(negated, use_container_width=True)
+                else:
+                    st.caption("None this run -- every green/decisive candle either passed the "
+                               "check or the loop wasn't active when it occurred.")
 
             st.subheader("Daily summary")
             st.caption(
